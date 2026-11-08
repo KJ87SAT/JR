@@ -66,8 +66,18 @@ jobs:
 
       # SoapySDR を使わない構成です。入力は純 Rust の RTL-TCP のみ
       # (src-tauri/Cargo.toml が Android では default-features = false にします)。
+      # Gradle の Rust ビルドタスクは、リポジトリ直下で `npm run -- tauri ...` を実行します。
+      # package.json に tauri スクリプトと CLI が無いと "Missing script: tauri" で
+      # 失敗するため、CI の作業コピー内だけで追加します (コミットされるファイルは
+      # 変えません)。init とビルドにも同じローカル CLI を使い、版を揃えます。
+      - name: Install the Tauri CLI locally
+        run: |
+          npm pkg set scripts.tauri=tauri
+          npm install --no-save --no-package-lock --ignore-scripts @tauri-apps/cli@2
+          npx tauri --version
+
       - name: Generate the Android project
-        run: npx --yes @tauri-apps/cli@2 android init --ci
+        run: npx tauri android init --ci
 
       # init が作る Gradle プロジェクトの compileSdk は Tauri CLI のバージョンで
       # 変わります (現行は 37)。生成された app/build.gradle.kts から読み取り、
@@ -166,17 +176,27 @@ jobs:
           mkdir -p dist-logs
           : > "$log"
           for attempt in 1 2 3; do
-            if npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci 2>&1 | tee -a "$log"; then
+            if npx tauri android build --apk --target "$ABI" --ci 2>&1 | tee -a "$log"; then
               exit 0
             fi
             echo "::warning::APK build failed (attempt ${attempt}/3); retrying"
             sleep 30
           done
           cp "$log" dist-logs/build.log
+          # 最後の失敗の直前 70 行 (npm / tauri / cargo のエラーはここに出ます) と、
+          # ログ全体から拾ったエラー行をまとめます。
+          last="$(grep -n 'FAILURE: Build failed' "$log" | tail -n1 | cut -d: -f1 || true)"
+          last="${last:-$(wc -l < "$log")}"
+          start=$(( last > 70 ? last - 70 : 1 ))
           {
-            echo '## Android build failed: Gradle / compiler messages'
+            echo '## Android build failed'
+            echo '### Lines just before the last Gradle failure'
             echo '```'
-            awk '/FAILURE: Build failed|What went wrong|^> |^\* Where|error(\[E[0-9]+\])?:|Caused by|Could not|Execution failed|Exception/ {print}' "$log" | cut -c1-400 | awk '!seen[$0]++' | head -n 80
+            sed -n "${start},$((last + 12))p" "$log" | cut -c1-300 | grep -vE '^[[:space:]]+at (java|jdk|sun|org\.gradle)' || true
+            echo '```'
+            echo '### Error lines found anywhere in the log'
+            echo '```'
+            grep -nE 'npm error|npm ERR|error(\[E[0-9]+\])?:|Error:|panicked|could not|Could not|What went wrong' "$log" | cut -c1-300 | awk '!seen[substr($0, index($0, ":") + 1)]++' | head -n 40 || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
