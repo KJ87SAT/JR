@@ -98,8 +98,28 @@ jobs:
           fi
           sdkmanager --install ${platform:+"$platform"} "$build_tools"
 
+      # services.gradle.org は時々 504 などの一時エラーを返します。ビルド本体の前に
+      # Gradle 本体 (wrapper) の取得だけを間隔を空けて再試行します。
+      - name: Prefetch Gradle (with retries)
+        working-directory: src-tauri/gen/android
+        run: |
+          chmod +x gradlew
+          for attempt in 1 2 3 4 5; do
+            if ./gradlew --version; then exit 0; fi
+            echo "::warning::Gradle download failed (attempt ${attempt}/5); retrying"
+            sleep $((attempt * 20))
+          done
+          echo "::error::could not download Gradle after 5 attempts" >&2
+          exit 1
+
       - name: Build the release APK
-        run: npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci
+        run: |
+          for attempt in 1 2 3; do
+            if npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci; then exit 0; fi
+            echo "::warning::APK build failed (attempt ${attempt}/3); retrying"
+            sleep 30
+          done
+          exit 1
 
       - name: Sign the APK
         env:
