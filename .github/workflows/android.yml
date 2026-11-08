@@ -98,28 +98,38 @@ jobs:
           fi
           sdkmanager --install ${platform:+"$platform"} "$build_tools"
 
-      # GitHub のランナー (米国のデータセンター) から見た services.gradle.org は、
-      # 手元の環境では問題なくても 504 を返すことがあります。まず公式 URL を
-      # 間隔を空けて再試行し、それでも駄目なら GitHub 上の配布ミラーに切り替えます。
-      - name: Prefetch Gradle (with retries and mirror fallback)
+      # services.gradle.org (リダイレクト用サーバー) が 504 を返し続けることがあります。
+      # 実ファイルの配布元 downloads.gradle.org、GitHub 上のミラー、公式 URL の順に
+      # gradle-wrapper.properties の取得先を差し替えて、取れた時点で止めます。
+      # wrapper は取得先 URL ごとにキャッシュするので、ここで取れれば本ビルドでも使われます。
+      - name: Prefetch Gradle (mirror fallback)
         working-directory: src-tauri/gen/android
         run: |
           chmod +x gradlew
           props=gradle/wrapper/gradle-wrapper.properties
-          for attempt in 1 2 3; do
-            if ./gradlew --version; then exit 0; fi
-            echo "::warning::Gradle download failed (attempt ${attempt}/3); retrying"
-            sleep $((attempt * 20))
-          done
           version="$(grep -oE 'gradle-[0-9][0-9.]*-bin' "$props" | head -n1 | sed -E 's/^gradle-//; s/-bin$//')"
-          echo "::warning::switching to the GitHub mirror for Gradle ${version}"
-          sed -i -E "s#^distributionUrl=.*#distributionUrl=https\\://github.com/gradle/gradle-distributions/releases/download/v${version}/gradle-${version}-bin.zip#" "$props"
-          grep '^distributionUrl' "$props"
-          for attempt in 1 2 3; do
-            if ./gradlew --version; then exit 0; fi
-            sleep $((attempt * 20))
+          test -n "$version" || { echo "Gradle version not found in $props" >&2; exit 1; }
+          echo "Gradle ${version}"
+          for url in \
+            "https://downloads.gradle.org/distributions/gradle-${version}-bin.zip" \
+            "https://github.com/gradle/gradle-distributions/releases/download/v${version}/gradle-${version}-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-${version}-bin.zip"
+          do
+            escaped="${url/:/\\:}"
+            sed -i -E "s#^distributionUrl=.*#distributionUrl=${escaped}#" "$props"
+            echo "::group::try ${url}"
+            for attempt in 1 2; do
+              if ./gradlew --version; then
+                echo "::endgroup::"
+                grep '^distributionUrl' "$props"
+                exit 0
+              fi
+              sleep 15
+            done
+            echo "::endgroup::"
+            echo "::warning::could not download Gradle from ${url}"
           done
-          echo "::error::could not download Gradle" >&2
+          echo "::error::could not download Gradle from any source" >&2
           exit 1
 
       # 失敗時は、Gradle が出した本当の原因 ("What went wrong" など) を抜き出して
