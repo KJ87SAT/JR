@@ -98,28 +98,58 @@ jobs:
           fi
           sdkmanager --install ${platform:+"$platform"} "$build_tools"
 
-      # services.gradle.org は時々 504 などの一時エラーを返します。ビルド本体の前に
-      # Gradle 本体 (wrapper) の取得だけを間隔を空けて再試行します。
-      - name: Prefetch Gradle (with retries)
+      # GitHub のランナー (米国のデータセンター) から見た services.gradle.org は、
+      # 手元の環境では問題なくても 504 を返すことがあります。まず公式 URL を
+      # 間隔を空けて再試行し、それでも駄目なら GitHub 上の配布ミラーに切り替えます。
+      - name: Prefetch Gradle (with retries and mirror fallback)
         working-directory: src-tauri/gen/android
         run: |
           chmod +x gradlew
-          for attempt in 1 2 3 4 5; do
+          props=gradle/wrapper/gradle-wrapper.properties
+          for attempt in 1 2 3; do
             if ./gradlew --version; then exit 0; fi
-            echo "::warning::Gradle download failed (attempt ${attempt}/5); retrying"
+            echo "::warning::Gradle download failed (attempt ${attempt}/3); retrying"
             sleep $((attempt * 20))
           done
-          echo "::error::could not download Gradle after 5 attempts" >&2
+          version="$(grep -oE 'gradle-[0-9][0-9.]*-bin' "$props" | head -n1 | sed -E 's/^gradle-//; s/-bin$//')"
+          echo "::warning::switching to the GitHub mirror for Gradle ${version}"
+          sed -i -E "s#^distributionUrl=.*#distributionUrl=https\\://github.com/gradle/gradle-distributions/releases/download/v${version}/gradle-${version}-bin.zip#" "$props"
+          grep '^distributionUrl' "$props"
+          for attempt in 1 2 3; do
+            if ./gradlew --version; then exit 0; fi
+            sleep $((attempt * 20))
+          done
+          echo "::error::could not download Gradle" >&2
           exit 1
 
+      # 失敗時は、Gradle が出した本当の原因 ("What went wrong" など) を抜き出して
+      # ログ末尾と実行結果ページの Summary に載せます。全文は build.log として
+      # Artifacts にも保存します。
       - name: Build the release APK
         run: |
-          for attempt in 1 2 3; do
-            if npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci; then exit 0; fi
-            echo "::warning::APK build failed (attempt ${attempt}/3); retrying"
-            sleep 30
-          done
+          set -o pipefail
+          log="$RUNNER_TEMP/build.log"
+          mkdir -p dist-logs
+          if npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          cp "$log" dist-logs/build.log
+          {
+            echo '## Android build failed: Gradle / compiler messages'
+            echo '```'
+            awk '/FAILURE: Build failed|What went wrong|^> |^\* Where|error(\[E[0-9]+\])?:|Caused by|Could not|Execution failed|Exception/ {print}' "$log" | cut -c1-400 | head -n 80
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
+
+      - name: Upload the full build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: dist-logs/build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Sign the APK
         env:
