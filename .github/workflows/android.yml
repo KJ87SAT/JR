@@ -70,22 +70,33 @@ jobs:
         run: npx --yes @tauri-apps/cli@2 android init --ci
 
       # init が作る Gradle プロジェクトの compileSdk は Tauri CLI のバージョンで
-      # 変わります (現行は 37)。固定値を入れると合わなくなるので、生成された
-      # app/build.gradle.kts から読み取って、その SDK プラットフォームと最新の
-      # build-tools を入れます。
+      # 変わります (現行は 37)。生成された app/build.gradle.kts から読み取り、
+      # その SDK プラットフォームと最新の build-tools を入れます。新しい Android は
+      # "android-37" ではなく "android-37.0" のように小数付きの名前で配布される
+      # ことがあるため、sdkmanager --list から実在する名前を探します。
       - name: Install the SDK platform the generated project needs
         run: |
           set -euo pipefail
           gradle_file=src-tauri/gen/android/app/build.gradle.kts
           compile_sdk="$(grep -oE 'compileSdk = [0-9]+' "$gradle_file" | grep -oE '[0-9]+' | head -n1)"
           test -n "$compile_sdk" || { echo "compileSdk not found in $gradle_file" >&2; exit 1; }
-          build_tools="$(sdkmanager --list 2>/dev/null \
-            | awk -F'|' '{gsub(/ /,"",$1)} $1 ~ /^build-tools;[0-9]+\.[0-9]+\.[0-9]+$/ {print $1}' \
-            | sort -V | tail -n1)"
-          test -n "$build_tools" || { echo "no build-tools found" >&2; exit 1; }
-          echo "compileSdk=${compile_sdk} / ${build_tools}"
-          sdkmanager --install "platforms;android-${compile_sdk}" "$build_tools"
-          echo "BUILD_TOOLS=${build_tools#build-tools;}" >> "$GITHUB_ENV"
+
+          sdkmanager --list 2>/dev/null | awk -F'|' '{gsub(/ /,"",$1); print $1}' | sort -u > "$RUNNER_TEMP/sdk-ids.txt"
+
+          build_tools="$(grep -E '^build-tools;[0-9]+\.[0-9]+\.[0-9]+$' "$RUNNER_TEMP/sdk-ids.txt" | sort -V | tail -n1 || true)"
+          platform="$(grep -E "^platforms;android-${compile_sdk}(\.[0-9]+)?$" "$RUNNER_TEMP/sdk-ids.txt" | sort -V | head -n1 || true)"
+          echo "compileSdk=${compile_sdk} / platform='${platform}' / build-tools='${build_tools}'"
+
+          if [ -z "$platform" ]; then
+            echo "::warning::platforms;android-${compile_sdk} was not listed by sdkmanager; Gradle will try to download it itself."
+            grep '^platforms;' "$RUNNER_TEMP/sdk-ids.txt" || true
+          fi
+          if [ -n "$build_tools" ]; then
+            echo "BUILD_TOOLS=${build_tools#build-tools;}" >> "$GITHUB_ENV"
+          else
+            echo "::error::no build-tools were listed by sdkmanager"; exit 1
+          fi
+          sdkmanager --install ${platform:+"$platform"} "$build_tools"
 
       - name: Build the release APK
         run: npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci
