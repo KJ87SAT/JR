@@ -120,43 +120,45 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('src-tauri/gen/android/build.gradle.kts', 'src-tauri/gen/android/app/build.gradle.kts', 'src-tauri/gen/android/buildSrc/build.gradle.kts') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      # services.gradle.org (リダイレクト用サーバー) が 504 を返し続けることがあります。
-      # 実ファイルの配布元 downloads.gradle.org、GitHub 上のミラー、公式 URL の順に
-      # gradle-wrapper.properties の取得先を差し替えて、取れた時点で止めます。
-      # wrapper は取得先 URL ごとにキャッシュするので、ここで取れれば本ビルドでも使われます。
-      - name: Prefetch Gradle (mirror fallback)
+      # Gradle wrapper の標準ダウンロードは「読み取り 10 秒で諦める・再試行が少ない」ため、
+      # 配布元が遅い/504 のときに落ちます。curl で長めのタイムアウトと再試行を付けて
+      # 自前でダウンロードし、wrapper にはそのローカルファイルを使わせます。
+      - name: Prefetch Gradle (curl with retries and mirrors)
         working-directory: src-tauri/gen/android
         run: |
+          set -euo pipefail
           chmod +x gradlew
           props=gradle/wrapper/gradle-wrapper.properties
           version="$(grep -oE 'gradle-[0-9][0-9.]*-bin' "$props" | head -n1 | sed -E 's/^gradle-//; s/-bin$//')"
           test -n "$version" || { echo "Gradle version not found in $props" >&2; exit 1; }
           echo "Gradle ${version}"
+          zip="$RUNNER_TEMP/gradle-${version}-bin.zip"
+          ok=0
           for url in \
             "https://downloads.gradle.org/distributions/gradle-${version}-bin.zip" \
             "https://github.com/gradle/gradle-distributions/releases/download/v${version}/gradle-${version}-bin.zip" \
-            "https://services.gradle.org/distributions/gradle-${version}-bin.zip"
+            "https://services.gradle.org/distributions/gradle-${version}-bin.zip" \
+            "https://repo.huaweicloud.com/gradle/gradle-${version}-bin.zip" \
+            "https://mirrors.cloud.tencent.com/gradle/gradle-${version}-bin.zip"
           do
-            escaped="${url/:/\\:}"
-            sed -i -E "s#^distributionUrl=.*#distributionUrl=${escaped}#" "$props"
-            echo "::group::try ${url}"
-            for attempt in 1 2; do
-              if ./gradlew --version; then
-                echo "::endgroup::"
-                grep '^distributionUrl' "$props"
-                exit 0
-              fi
-              sleep 15
-            done
+            echo "::group::download ${url}"
+            if curl -fL --retry 6 --retry-all-errors --retry-delay 10 \
+                 --connect-timeout 30 --max-time 900 -o "$zip" "$url" \
+               && unzip -tq "$zip" >/dev/null; then
+              echo "::endgroup::"
+              ok=1
+              break
+            fi
             echo "::endgroup::"
             echo "::warning::could not download Gradle from ${url}"
+            rm -f "$zip"
           done
-          echo "::error::could not download Gradle from any source" >&2
-          exit 1
+          test "$ok" = 1 || { echo "::error::could not download Gradle from any source" >&2; exit 1; }
+          sed -i -E "s#^distributionUrl=.*#distributionUrl=file\\://${zip}#" "$props"
+          sed -i -E 's#^networkTimeout=.*#networkTimeout=120000#' "$props"
+          grep -E '^(distributionUrl|networkTimeout)' "$props"
+          ./gradlew --version
 
-      # 失敗時は、Gradle が出した本当の原因 ("What went wrong" など) を抜き出して
-      # ログ末尾と実行結果ページの Summary に載せます。全文は build.log として
-      # Artifacts にも保存します。
       - name: Build the release APK
         run: |
           set -o pipefail
