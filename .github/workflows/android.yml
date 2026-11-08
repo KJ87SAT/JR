@@ -1,0 +1,110 @@
+name: Android APK
+
+# 個人用 Android アプリ (APK) を生成します。手動実行 (Actions タブ → Run workflow)
+# か、android-v* タグの push で動きます。成果物は実行結果ページの Artifacts から
+# ダウンロードできます。署名キーの扱いは docs/ANDROID.ja.md を参照してください。
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "対象 ABI（ほとんどの現行スマホは aarch64）"
+        type: choice
+        default: aarch64
+        options: [aarch64, armv7, x86_64, i686]
+  push:
+    tags: ["android-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ABI: ${{ inputs.abi || 'aarch64' }}
+  NDK_VERSION: 27.2.12479018
+  BUILD_TOOLS: 34.0.0
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK / NDK components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-34" \
+            "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.ABI == 'armv7' && 'armv7-linux-androideabi' || format('{0}-linux-android', env.ABI) }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ env.ABI }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # SoapySDR を使わない構成です。入力は純 Rust の RTL-TCP のみ
+      # (src-tauri/Cargo.toml が Android では default-features = false にします)。
+      - name: Generate the Android project
+        run: npx --yes @tauri-apps/cli@2 android init --ci
+
+      - name: Build the release APK
+        run: npx --yes @tauri-apps/cli@2 android build --apk --target "$ABI" --ci
+
+      - name: Sign the APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          bt="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}"
+          unsigned="$(find src-tauri/gen/android -path '*outputs/apk*' -path '*release*' -name '*.apk' | head -n1)"
+          test -n "$unsigned" || { echo "release APK not found" >&2; exit 1; }
+          keystore="$RUNNER_TEMP/release.keystore"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+            alias="${KEY_ALIAS:-key0}"
+            password="$KEYSTORE_PASSWORD"
+            note="登録済みのキーで署名しました。同じキーで署名した新しい版は上書きインストールできます。"
+          else
+            alias=key0
+            password="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$keystore" -storepass "$password" \
+              -keypass "$password" -alias "$alias" -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=JR West Radio Receiver (personal)"
+            note="一時キーで署名しました（毎回別のキー）。更新するときは先に古いアプリをアンインストールしてください。固定するには docs/ANDROID.ja.md のシークレット設定を行います。"
+          fi
+          "$bt/zipalign" -p -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+          mkdir -p dist
+          "$bt/apksigner" sign --ks "$keystore" --ks-key-alias "$alias" \
+            --ks-pass "pass:$password" --key-pass "pass:$password" \
+            --out "dist/jr-west-radio-receiver-${ABI}.apk" "$RUNNER_TEMP/aligned.apk"
+          "$bt/apksigner" verify --verbose "dist/jr-west-radio-receiver-${ABI}.apk"
+          echo "$note" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jr-west-radio-receiver-${{ env.ABI }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
